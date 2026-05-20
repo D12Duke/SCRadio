@@ -1,0 +1,7 @@
+pygame
+mss
+numpy
+keyboard
+Pillow
+scipy
+opencv-python-headless

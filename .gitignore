@@ -1,0 +1,25 @@
+# virtualenv
+venv/
+.venv/
+
+# python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# runtime state / user-specific
+config.ini
+sclr.log
+template.png
+
+# debug artifacts
+tshots/
+probe_mon*_*.png
+verify_filter.py
+verify_shape.py
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
