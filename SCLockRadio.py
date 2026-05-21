@@ -1095,7 +1095,10 @@ class App:
     def _build_ui(self):
         r = self.root
         r.title("SC Lock Radio")
-        r.geometry("500x620")
+        # Window: extra height vs the original 620 because Part 2 added a
+        # second folder picker (combat + non-combat). Ticker was getting
+        # clipped off the bottom on the old size.
+        r.geometry("500x780")
         r.configure(bg=BG)
 
         style = ttk.Style()
