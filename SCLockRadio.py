@@ -4,6 +4,7 @@ ASCII only. No Unicode anywhere.
 """
 
 import atexit
+import collections
 import configparser
 import ctypes
 import logging
@@ -112,9 +113,9 @@ CENTER_REGION_FRAC_H = 0.10
 #   by tight G/B cap.
 # - Dark cockpit panel glow is dimmer (R < 175) -> reject by lower-bound R.
 LOCK_R_MIN = 175
-LOCK_R_MAX = 230
-LOCK_G_MAX = 65
-LOCK_B_MAX = 65
+LOCK_R_MAX = 215   # was 230; tightened to reject brighter cockpit highlights
+LOCK_G_MAX = 50    # was 65; tightened to reject amber cockpit beam transitions
+LOCK_B_MAX = 50    # was 65; matches the new G cap for a tighter red box
 # legacy fallback fields still referenced by snapshot/debug logging
 RED_R_MIN = LOCK_R_MIN
 RED_DELTA = 60
@@ -171,7 +172,8 @@ def config_path():
 
 class Config:
     def __init__(self):
-        self.music_folder = ""
+        self.combat_folder = ""        # plays during lock engagement
+        self.non_combat_folder = ""    # plays as ambient default
         self.scan_interval = 2
         self.lock_timeout = 5
         # Default threshold ~= one bracket leg (~15 red pixels). User snapshots
@@ -188,7 +190,14 @@ class Config:
             cp.read(path)
             if cp.has_section("settings"):
                 s = cp["settings"]
-                self.music_folder = s.get("music_folder", self.music_folder)
+                # New fields:
+                self.combat_folder = s.get("combat_folder", self.combat_folder)
+                self.non_combat_folder = s.get("non_combat_folder",
+                                               self.non_combat_folder)
+                # Back-compat migration: old single 'music_folder' becomes
+                # combat_folder if combat_folder wasn't explicitly set.
+                if not self.combat_folder:
+                    self.combat_folder = s.get("music_folder", "")
                 self.scan_interval = int(s.get("scan_interval", str(self.scan_interval)))
                 self.lock_timeout = int(s.get("lock_timeout", str(self.lock_timeout)))
                 self.brightness_threshold = int(
@@ -202,7 +211,8 @@ class Config:
         self.clamp()
         cp = configparser.ConfigParser()
         cp["settings"] = {
-            "music_folder": self.music_folder,
+            "combat_folder": self.combat_folder,
+            "non_combat_folder": self.non_combat_folder,
             "scan_interval": str(self.scan_interval),
             "lock_timeout": str(self.lock_timeout),
             "brightness_threshold": str(self.brightness_threshold),
@@ -228,84 +238,364 @@ class Config:
             self.brightness_threshold = 200
 
 
-class MusicPlayer:
-    """Wraps pygame.mixer. Owns the shuffled playlist and current-track state."""
+class CrossfadePlayer:
+    """Two-stream music player.
+
+    - Two independent shuffled playlists: non-combat (ambient default) and
+      combat (engaged-target soundtrack).
+    - When START is pressed, non-combat begins playing on channel 0.
+    - On engage_combat(): non-combat fades out over FADE_MS, combat fades in
+      on channel 1 over FADE_MS (true crossfade, ~2s overlap).
+    - On disengage_combat(): combat fades out, non-combat fades in (a fresh
+      non-combat song -- we advance the queue rather than resume).
+    - tick() auto-advances each queue when its current song finishes.
+    - Each playlist reshuffles every time it's exhausted.
+    """
+
+    FADE_MS = 7000
 
     def __init__(self):
-        pygame.mixer.init()
-        self.tracks = []
-        self.index = 0
-        self.current_name = ""
-        self._lock = threading.Lock()
-
-    def load_folder(self, folder):
-        with self._lock:
-            self.tracks = []
-            self.index = 0
-            self.current_name = ""
-            if not folder or not os.path.isdir(folder):
-                return 0
-            files = []
-            for entry in os.listdir(folder):
-                low = entry.lower()
-                if low.endswith(".mp3"):
-                    files.append(os.path.join(folder, entry))
-            random.shuffle(files)
-            self.tracks = files
-            return len(self.tracks)
-
-    def track_count(self):
-        with self._lock:
-            return len(self.tracks)
-
-    def _start_index_locked(self):
-        if not self.tracks:
-            self.current_name = ""
-            return False
-        path = self.tracks[self.index]
-        self.current_name = os.path.splitext(os.path.basename(path))[0]
+        # 16386 samples at 48kHz = ~341ms headroom. User reported 16k felt
+        # best; bigger (32k) didn't help. Likely cause of remaining hiccups
+        # is sample-rate mismatch -- Windows default is usually 48000 Hz, so
+        # we match it here to eliminate the on-the-fly resampling step.
         try:
-            pygame.mixer.music.load(path)
-            pygame.mixer.music.play()
-            return True
+            pygame.mixer.pre_init(frequency=48000, size=-16, channels=2,
+                                  buffer=16386)
         except Exception:
-            self.current_name = ""
-            return False
+            pass
+        pygame.mixer.init()
+        if pygame.mixer.get_num_channels() < 4:
+            pygame.mixer.set_num_channels(8)
+        self.ch_nc = pygame.mixer.Channel(0)  # non-combat
+        self.ch_co = pygame.mixer.Channel(1)  # combat
+        # Re-entrant lock: _play_*_next runs with _lock held (caller=start/
+        # engage/disengage/tick) and itself calls _top_up_preload_* which
+        # also wants _lock. Without RLock this self-deadlocks the player.
+        self._lock = threading.RLock()
+        # Playlists + indices
+        self.nc_tracks = []
+        self.co_tracks = []
+        self.nc_index = 0
+        self.co_index = 0
+        # Currently playing Sound objects (kept referenced so they aren't GC'd)
+        self.nc_sound = None
+        self.co_sound = None
+        self.nc_name = ""
+        self.co_name = ""
+        # Manual-fade state. We do crossfades by ramping channel.set_volume()
+        # 60 times across FADE_MS instead of using pygame's fade_ms argument,
+        # because pygame's built-in fade can produce micro-glitches on some
+        # audio drivers. ramp_id is incremented every time a new ramp starts
+        # on a channel; in-flight ramps check their id before each step and
+        # bail if superseded, so back-to-back engage/disengage doesn't fight.
+        self._ramp_lock = threading.Lock()
+        self._ramp_id_nc = 0
+        self._ramp_id_co = 0
 
+        # Preload pipeline: each queue has a dedicated worker thread that
+        # processes a FIFO job queue of file paths, decodes them, and appends
+        # the resulting Sound to a ready-deque. _play_*_next pops from the
+        # ready-deque so transitions never block on decode.
+        # PRELOAD_DEPTH=2 means we always try to keep the next 2 tracks
+        # decoded and waiting, so a rapid C->N->C cycle still hits warm
+        # preloads on both sides.
+        self.PRELOAD_DEPTH = 2
+        self._preload_lock = threading.Lock()
+        self.preload_nc = collections.deque()  # (path, Sound)
+        self.preload_co = collections.deque()
+        self._jobs_nc = queue.Queue()
+        self._jobs_co = queue.Queue()
+        self._worker_stop = threading.Event()
+        self._worker_nc = threading.Thread(target=self._preload_worker,
+                                           args=(self._jobs_nc, self.preload_nc, "nc"),
+                                           daemon=True, name="preload-nc-worker")
+        self._worker_co = threading.Thread(target=self._preload_worker,
+                                           args=(self._jobs_co, self.preload_co, "co"),
+                                           daemon=True, name="preload-co-worker")
+        self._worker_nc.start()
+        self._worker_co.start()
+        # State
+        self.started = False
+        self.in_combat = False
+
+    # ---- folder loading ----
+    def _load_folder(self, folder):
+        if not folder or not os.path.isdir(folder):
+            return []
+        files = []
+        for entry in os.listdir(folder):
+            if entry.lower().endswith(".mp3"):
+                files.append(os.path.join(folder, entry))
+        random.shuffle(files)
+        return files
+
+    def load_non_combat_folder(self, folder):
+        with self._lock:
+            self.nc_tracks = self._load_folder(folder)
+            self.nc_index = 0
+        # Reset preload state for this category
+        self._reset_preload_nc()
+        n = self.non_combat_count()
+        if n > 0:
+            self._top_up_preload_nc()
+        return n
+
+    def load_combat_folder(self, folder):
+        with self._lock:
+            self.co_tracks = self._load_folder(folder)
+            self.co_index = 0
+        self._reset_preload_co()
+        n = self.combat_count()
+        if n > 0:
+            self._top_up_preload_co()
+        return n
+
+    # ---- preload pipeline ----
+    def _preload_worker(self, jobs, out_deque, tag):
+        """Background thread. Pulls file paths from `jobs`, decodes, appends
+        to `out_deque`. Maintains FIFO order, so the ready deque's left side
+        is always the NEXT track to play."""
+        while not self._worker_stop.is_set():
+            try:
+                path = jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if path is None:
+                return
+            try:
+                sound = pygame.mixer.Sound(path)
+            except Exception as ex:
+                LOG.warning("%s preload failed %s: %s", tag,
+                            os.path.basename(path), ex)
+                continue
+            with self._preload_lock:
+                out_deque.append((path, sound))
+            LOG.debug("%s preloaded: %s (ready depth=%d)",
+                      tag, os.path.basename(path), len(out_deque))
+
+    def _reset_preload_nc(self):
+        with self._preload_lock:
+            self.preload_nc.clear()
+        # Drain pending jobs
+        while True:
+            try:
+                self._jobs_nc.get_nowait()
+            except queue.Empty:
+                break
+
+    def _reset_preload_co(self):
+        with self._preload_lock:
+            self.preload_co.clear()
+        while True:
+            try:
+                self._jobs_co.get_nowait()
+            except queue.Empty:
+                break
+
+    def _top_up_preload_nc(self):
+        """Enqueue jobs so preload_nc reaches PRELOAD_DEPTH ready tracks.
+        Counts what's ready + inflight (job queue size) so we don't double-fire."""
+        with self._lock:
+            tracks = list(self.nc_tracks)
+            cur_idx = self.nc_index
+        if not tracks:
+            return
+        with self._preload_lock:
+            ready = len(self.preload_nc)
+        inflight = self._jobs_nc.qsize()
+        total = ready + inflight
+        need = self.PRELOAD_DEPTH - total
+        for i in range(need):
+            offset = total + i
+            target_idx = (cur_idx + offset) % len(tracks)
+            self._jobs_nc.put(tracks[target_idx])
+
+    def _top_up_preload_co(self):
+        with self._lock:
+            tracks = list(self.co_tracks)
+            cur_idx = self.co_index
+        if not tracks:
+            return
+        with self._preload_lock:
+            ready = len(self.preload_co)
+        inflight = self._jobs_co.qsize()
+        total = ready + inflight
+        need = self.PRELOAD_DEPTH - total
+        for i in range(need):
+            offset = total + i
+            target_idx = (cur_idx + offset) % len(tracks)
+            self._jobs_co.put(tracks[target_idx])
+
+    def non_combat_count(self):
+        with self._lock:
+            return len(self.nc_tracks)
+
+    def combat_count(self):
+        with self._lock:
+            return len(self.co_tracks)
+
+    # ---- playback helpers (internal, assume self._lock held) ----
+    def _play_nc_next(self, fade_in):
+        """Start the next non-combat track. Pops from the ready deque (warm
+        preload). Falls back to synchronous decode ONLY if both ready deque
+        AND inflight job queue are empty -- rare, e.g. very first play."""
+        if not self.nc_tracks:
+            self.nc_sound = None
+            self.nc_name = ""
+            return
+        with self._preload_lock:
+            if self.preload_nc:
+                path, sound = self.preload_nc.popleft()
+            else:
+                path = None
+                sound = None
+        if sound is None:
+            path = self.nc_tracks[self.nc_index]
+            try:
+                sound = pygame.mixer.Sound(path)
+                LOG.warning("nc sync-decoded (preload was empty): %s",
+                            os.path.basename(path))
+            except Exception as ex:
+                LOG.warning("nc decode (sync) failed %s: %s", path, ex)
+                self.nc_sound = None
+                self.nc_name = ""
+                return
+        self.nc_sound = sound
+        self.nc_name = os.path.splitext(os.path.basename(path))[0]
+        fade_ms = self.FADE_MS if fade_in else 0
+        try:
+            self.ch_nc.play(self.nc_sound, fade_ms=fade_ms)
+        except Exception as ex:
+            LOG.warning("nc play failed: %s", ex)
+            return
+        LOG.info("Non-combat playing: %s (fade_in=%s)", self.nc_name, fade_in)
+        self.nc_index += 1
+        if self.nc_index >= len(self.nc_tracks):
+            random.shuffle(self.nc_tracks)
+            self.nc_index = 0
+        # Top up preload buffer back to PRELOAD_DEPTH
+        self._top_up_preload_nc()
+
+    def _play_co_next(self, fade_in):
+        if not self.co_tracks:
+            self.co_sound = None
+            self.co_name = ""
+            return
+        with self._preload_lock:
+            if self.preload_co:
+                path, sound = self.preload_co.popleft()
+            else:
+                path = None
+                sound = None
+        if sound is None:
+            path = self.co_tracks[self.co_index]
+            try:
+                sound = pygame.mixer.Sound(path)
+                LOG.warning("co sync-decoded (preload was empty): %s",
+                            os.path.basename(path))
+            except Exception as ex:
+                LOG.warning("co decode (sync) failed %s: %s", path, ex)
+                self.co_sound = None
+                self.co_name = ""
+                return
+        self.co_sound = sound
+        self.co_name = os.path.splitext(os.path.basename(path))[0]
+        fade_ms = self.FADE_MS if fade_in else 0
+        try:
+            self.ch_co.play(self.co_sound, fade_ms=fade_ms)
+        except Exception as ex:
+            LOG.warning("co play failed: %s", ex)
+            return
+        LOG.info("Combat playing: %s (fade_in=%s)", self.co_name, fade_in)
+        self.co_index += 1
+        if self.co_index >= len(self.co_tracks):
+            random.shuffle(self.co_tracks)
+            self.co_index = 0
+        self._top_up_preload_co()
+
+    # ---- public API ----
     def start(self):
+        """Begin ambient playback (non-combat)."""
         with self._lock:
-            if not self.tracks:
-                return False
-            return self._start_index_locked()
-
-    def advance(self):
-        with self._lock:
-            if not self.tracks:
-                return False
-            self.index += 1
-            if self.index >= len(self.tracks):
-                # reshuffle and restart playlist
-                random.shuffle(self.tracks)
-                self.index = 0
-            return self._start_index_locked()
+            if self.started:
+                return
+            self.started = True
+            self.in_combat = False
+            if self.nc_tracks:
+                self._play_nc_next(fade_in=True)
 
     def stop(self):
+        """Stop everything immediately. Used on STOP button / app close."""
         with self._lock:
+            self.started = False
+            self.in_combat = False
             try:
-                pygame.mixer.music.stop()
+                self.ch_nc.stop()
+                self.ch_co.stop()
             except Exception:
                 pass
-            self.current_name = ""
+            self.nc_sound = None
+            self.co_sound = None
+            self.nc_name = ""
+            self.co_name = ""
+
+    def engage_combat(self):
+        """Crossfade non-combat -> combat. Picks a fresh combat song."""
+        with self._lock:
+            if not self.started or self.in_combat:
+                return
+            if not self.co_tracks:
+                LOG.info("engage_combat ignored: no combat tracks loaded")
+                return
+            # Fade out non-combat
+            try:
+                if self.ch_nc.get_busy():
+                    self.ch_nc.fadeout(self.FADE_MS)
+            except Exception:
+                pass
+            # Fade in combat (new song)
+            self._play_co_next(fade_in=True)
+            self.in_combat = True
+
+    def disengage_combat(self):
+        """Crossfade combat -> non-combat. Picks next non-combat song."""
+        with self._lock:
+            if not self.started or not self.in_combat:
+                return
+            try:
+                if self.ch_co.get_busy():
+                    self.ch_co.fadeout(self.FADE_MS)
+            except Exception:
+                pass
+            self._play_nc_next(fade_in=True)
+            self.in_combat = False
+
+    def tick(self):
+        """Advance the active queue if its current song has ended.
+        Called periodically by the detector thread."""
+        with self._lock:
+            if not self.started:
+                return
+            try:
+                if self.in_combat:
+                    if self.co_sound and not self.ch_co.get_busy():
+                        self._play_co_next(fade_in=False)
+                else:
+                    if self.nc_sound and not self.ch_nc.get_busy():
+                        self._play_nc_next(fade_in=False)
+            except Exception:
+                pass
 
     def is_playing(self):
         try:
-            return bool(pygame.mixer.music.get_busy())
+            return bool(self.ch_nc.get_busy() or self.ch_co.get_busy())
         except Exception:
             return False
 
     def now_playing(self):
         with self._lock:
-            return self.current_name
+            return self.co_name if self.in_combat else self.nc_name
 
 
 class Detector(threading.Thread):
@@ -317,6 +607,11 @@ class Detector(threading.Thread):
         self.q = app.event_q
         self._stop_event = threading.Event()
         self.last_t_press_ts = 0.0
+        # Tracks previous-scan cond_b so we can detect a True->False edge
+        # while combat is active (i.e. moment of "lock lost") and snapshot
+        # the screen for diagnostics.
+        self._prev_cond_b = False
+        self._losslock_snap_count = 0
         self._kb_hook = None
         # measure primary monitor
         with mss.mss() as sct:
@@ -365,21 +660,13 @@ class Detector(threading.Thread):
             pass
         self._dump_next = False
         self._t_press_count = 0
-        # Template held in memory; auto-captured from current screen on T press.
-        # No disk file required.
-        self._template_gray = None
-        self._auto_capture_pending = False  # set True on each T press
 
     def _on_t(self, e):
         # keyboard.on_press_key fires for press only
         self.last_t_press_ts = time.time()
         self._dump_next = True
-        # T resets template tracking: the next scan grabs a fresh template
-        # from the current screen so we lock onto THIS target's bracket.
-        self._auto_capture_pending = True
-        self._template_gray = None
         try:
-            LOG.info("T pressed (event scan_code=%s name=%s) - template reset",
+            LOG.info("T pressed (event scan_code=%s name=%s)",
                      getattr(e, "scan_code", "?"), getattr(e, "name", "?"))
         except Exception:
             pass
@@ -443,6 +730,14 @@ class Detector(threading.Thread):
         r = search_arr[:, :, 2]
         mask = ((r >= LOCK_R_MIN) & (r <= LOCK_R_MAX)
                 & (g <= LOCK_G_MAX) & (b <= LOCK_B_MAX))
+        # Reticle + cockpit-beam exclusion: SC's reticle is dead-center, AND
+        # the horizontal cockpit beam runs through center on most ships. An
+        # 80x80 hole covers both. The lock bracket sits AROUND the target,
+        # which is usually visible in the area outside the hole.
+        h, w = mask.shape
+        cy, cx = h // 2, w // 2
+        hole = 40  # half-width of exclusion (80x80 total)
+        mask[max(0, cy - hole):cy + hole, max(0, cx - hole):cx + hole] = False
         total_lock_red = int(mask.sum())
         if total_lock_red == 0:
             return 0, 0, 0, 0.0
@@ -482,6 +777,45 @@ class Detector(threading.Thread):
             # bracket / text character / short bracket-line shape -> keep
             score += sz
         return score, total_lock_red, biggest, biggest_aspect
+
+    def _save_lostlock_snapshot(self, sct, bright, total_red, biggest_blob, aspect):
+        """Save a snapshot at the moment cond_b drops during combat.
+        Saves both the analysis search region AND a wider context view so we
+        can see what red element JUST vanished (or whether something else
+        persisted)."""
+        self._losslock_snap_count += 1
+        n = self._losslock_snap_count
+        ts = time.strftime("%H%M%S")
+        roi = np.asarray(sct.grab(self.search_region))
+        roi_rgb = roi[:, :, [2, 1, 0]].astype(np.uint8)
+        roi_name = ("lostlock%03d_%s_score=%d_red=%d_blob=%d_asp=%.1f_search.png"
+                    % (n, ts, bright, total_red, biggest_blob, aspect))
+        Image.fromarray(roi_rgb, "RGB").save(
+            os.path.join(self.shots_dir, roi_name))
+        # Wider context: 2x the search region
+        cw = self.search_region["width"] * 2
+        ch = self.search_region["height"] * 2
+        cx = self.search_region["left"] + self.search_region["width"] // 2
+        cy = self.search_region["top"] + self.search_region["height"] // 2
+        ctx_region = {"left": cx - cw // 2, "top": cy - ch // 2,
+                      "width": cw, "height": ch}
+        ctx = np.asarray(sct.grab(ctx_region))
+        ctx_rgb = ctx[:, :, [2, 1, 0]].astype(np.uint8).copy()
+        # outline the search box in green
+        ox = self.search_region["left"] - ctx_region["left"]
+        oy = self.search_region["top"] - ctx_region["top"]
+        rx2 = ox + self.search_region["width"]
+        ry2 = oy + self.search_region["height"]
+        for thick in range(2):
+            ctx_rgb[oy + thick, ox:rx2, :] = (0, 255, 0)
+            ctx_rgb[ry2 - 1 - thick, ox:rx2, :] = (0, 255, 0)
+            ctx_rgb[oy:ry2, ox + thick, :] = (0, 255, 0)
+            ctx_rgb[oy:ry2, rx2 - 1 - thick, :] = (0, 255, 0)
+        Image.fromarray(ctx_rgb, "RGB").save(
+            os.path.join(self.shots_dir,
+                         "lostlock%03d_%s_context.png" % (n, ts)))
+        LOG.info("LOST-LOCK snapshot #%d: bright=%d red=%d blob=%d asp=%.2f -> %s",
+                 n, bright, total_red, biggest_blob, aspect, roi_name)
 
     def _save_debug_snapshots(self, sct, bright, total_red=0, biggest_blob=0, aspect=0.0):
         ts = time.strftime("%H%M%S")
@@ -567,80 +901,74 @@ class Detector(threading.Thread):
                         except Exception as ex:
                             LOG.warning("debug snapshot failed: %s", ex)
 
+                    # Lock-lost diagnostic: when combat is active and cond_b
+                    # transitions True -> False, save a snapshot. This catches
+                    # the exact frame where the detector thinks the bracket
+                    # is gone -- helps diagnose situations where the player
+                    # expected the lock to release but it didn't (e.g. kill
+                    # notification text persisting in the search region).
+                    if player.in_combat and self._prev_cond_b and not cond_b:
+                        try:
+                            self._save_lostlock_snapshot(sct, bright, total_red,
+                                                          biggest_blob, aspect)
+                        except Exception as ex:
+                            LOG.warning("lostlock snapshot failed: %s", ex)
+                    self._prev_cond_b = cond_b
+
                     # live diagnostics to UI
                     self.q.put(("debug", t_age, bright, bright_thresh, cond_a, cond_b))
-                    LOG.debug("scan t_age=%s score=%d/%d red_total=%d blob=%d aspect=%.2f fg=%r sc=%s A=%s B=%s playing=%s",
+                    LOG.debug("scan t_age=%s score=%d/%d red_total=%d blob=%d aspect=%.2f fg=%r sc=%s A=%s B=%s in_combat=%s",
                               ("%.2f" % t_age) if t_age is not None else "None",
                               bright, bright_thresh, total_red, biggest_blob, aspect,
                               fg_title[:40], fg_is_sc,
-                              cond_a, cond_b, player.is_playing())
+                              cond_a, cond_b, player.in_combat)
 
-                    playing = player.is_playing()
-
-                    if not playing:
+                    if not player.in_combat:
+                        # Ambient (non-combat) state. Music is playing in the
+                        # background. Watch for lock to fire combat music.
                         if cond_a and cond_b:
-                            LOG.info("LOCK TRIGGER: starting music")
-                            ok = player.start()
-                            if ok:
-                                LOG.info("Music started: %s", player.now_playing())
-                                timeout_started_at = None
-                                self.q.put(("status", ST_LOCKED, 0))
-                                self.q.put(("now_playing", player.now_playing()))
-                            else:
-                                LOG.warning("player.start() returned False (no tracks?)")
-                                self.q.put(("status", ST_SCAN, 0))
+                            LOG.info("LOCK TRIGGER: engaging combat music")
+                            player.engage_combat()
+                            timeout_started_at = None
+                            self.q.put(("status", ST_LOCKED, 0))
+                            self.q.put(("now_playing", player.now_playing()))
                         else:
                             self.q.put(("status", ST_SCAN, 0))
                     else:
-                        # music is currently playing
+                        # Combat is active. Watch for lock loss; on countdown
+                        # completion, fade back to non-combat.
                         if cond_b:
-                            # lock still confirmed
+                            # lock still confirmed -> reset timer, keep combat
                             timeout_started_at = None
-                            if cond_a:
-                                # T pressed again -> spec calls this target-switch:
-                                # reset timer. Timer is already reset above.
-                                pass
                             self.q.put(("status", ST_LOCKED, 0))
+                            self.q.put(("now_playing", player.now_playing()))
                         else:
-                            # condB failed -> countdown
                             if timeout_started_at is None:
                                 timeout_started_at = time.time()
                             elapsed = time.time() - timeout_started_at
                             remaining = int(max(0, lock_timeout - elapsed + 0.999))
                             if elapsed >= lock_timeout:
-                                player.stop()
+                                player.disengage_combat()
                                 timeout_started_at = None
-                                # Invalidate the T-press window: after the
-                                # countdown completes (whatever the user has
-                                # the Lock Timeout slider set to), the user
-                                # must press T again to start a new lock.
-                                # Otherwise a within-T_PRESS_WINDOW_SECONDS T
-                                # from before would auto-restart music the
-                                # moment a bracket reappears.
+                                # Invalidate T-press window so a stale T from
+                                # before doesn't re-fire combat the moment a
+                                # bracket reappears.
                                 self.last_t_press_ts = 0.0
-                                LOG.info("Lock-lost timeout reached (%ds): music stopped, T invalidated", lock_timeout)
+                                LOG.info("Lock-lost timeout reached (%ds): combat -> non-combat, T invalidated", lock_timeout)
                                 self.q.put(("status", ST_SCAN, 0))
-                                self.q.put(("now_playing", ""))
+                                self.q.put(("now_playing", player.now_playing()))
                             else:
                                 self.q.put(("status", ST_TIMEOUT, remaining))
 
-                    # advance to next song when current ends
-                    if player.track_count() > 0 and not player.is_playing():
-                        # Only auto-advance if we previously HAD a current track
-                        # (i.e. we were playing). Otherwise this would auto-start
-                        # without a lock. now_playing() returns "" after stop().
-                        if player.now_playing():
-                            player.advance()
-                            self.q.put(("now_playing", player.now_playing()))
+                    # Advance the active queue if its current song ended.
+                    player.tick()
 
-                    # sleep in small chunks so stop is responsive
+                    # Sleep in small chunks so stop is responsive AND so song
+                    # transitions feel snappy (we tick mid-interval too).
                     end = time.time() + float(scan_interval)
                     while time.time() < end and not self._stop_event.is_set():
-                        time.sleep(0.05)
-                        # detect song-end mid-interval so transitions feel snappy
-                        if player.now_playing() and not player.is_playing():
-                            player.advance()
-                            self.q.put(("now_playing", player.now_playing()))
+                        time.sleep(0.1)
+                        player.tick()
         finally:
             try:
                 if self._kb_hook is not None:
@@ -656,9 +984,11 @@ class App:
         self.cfg = Config()
         self.cfg.load()
 
-        self.player = MusicPlayer()
-        if self.cfg.music_folder:
-            self.player.load_folder(self.cfg.music_folder)
+        self.player = CrossfadePlayer()
+        if self.cfg.combat_folder:
+            self.player.load_combat_folder(self.cfg.combat_folder)
+        if self.cfg.non_combat_folder:
+            self.player.load_non_combat_folder(self.cfg.non_combat_folder)
 
         self.event_q = queue.Queue()
         self.detector = None
@@ -696,28 +1026,47 @@ class App:
                          font=("Segoe UI", 20, "bold"))
         title.pack(pady=(14, 10))
 
-        # Playlist section
+        # Playlist section: two folder pickers
         pl = tk.Frame(r, bg=PANEL, padx=10, pady=10)
         pl.pack(fill="x", padx=12, pady=6)
-        tk.Label(pl, text="Music Folder", bg=PANEL, fg=TEXT,
+
+        # Non-combat (ambient default) folder
+        tk.Label(pl, text="Non-Combat Folder (ambient)", bg=PANEL, fg=TEXT,
                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        nc_row = tk.Frame(pl, bg=PANEL)
+        nc_row.pack(fill="x", pady=(2, 2))
+        self.nc_folder_var = tk.StringVar(value=self.cfg.non_combat_folder)
+        self.nc_folder_entry = tk.Entry(nc_row, textvariable=self.nc_folder_var,
+                                        state="readonly", readonlybackground=BG,
+                                        fg=TEXT, disabledforeground=TEXT,
+                                        relief="flat")
+        self.nc_folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Button(nc_row, text="Browse", command=self._on_browse_non_combat,
+                  bg=PANEL, fg=TEXT, activebackground="#444444",
+                  activeforeground=TEXT, relief="flat", padx=10
+                  ).pack(side="right")
+        self.nc_count_var = tk.StringVar(value="Non-Combat Tracks: 0")
+        tk.Label(pl, textvariable=self.nc_count_var, bg=PANEL, fg=GREY,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 6))
 
-        row = tk.Frame(pl, bg=PANEL)
-        row.pack(fill="x", pady=(4, 4))
-        self.folder_var = tk.StringVar(value=self.cfg.music_folder)
-        self.folder_entry = tk.Entry(row, textvariable=self.folder_var,
-                                     state="readonly", readonlybackground=BG,
-                                     fg=TEXT, disabledforeground=TEXT,
-                                     relief="flat")
-        self.folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        browse = tk.Button(row, text="Browse", command=self._on_browse,
-                           bg=ACCENT, fg=TEXT, activebackground="#aa0000",
-                           activeforeground=TEXT, relief="flat", padx=10)
-        browse.pack(side="right")
-
-        self.track_count_var = tk.StringVar(value="Tracks Loaded: 0")
-        tk.Label(pl, textvariable=self.track_count_var, bg=PANEL, fg=TEXT).pack(
-            anchor="w")
+        # Combat (lock-engaged) folder
+        tk.Label(pl, text="Combat Folder (lock engaged)", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        co_row = tk.Frame(pl, bg=PANEL)
+        co_row.pack(fill="x", pady=(2, 2))
+        self.co_folder_var = tk.StringVar(value=self.cfg.combat_folder)
+        self.co_folder_entry = tk.Entry(co_row, textvariable=self.co_folder_var,
+                                        state="readonly", readonlybackground=BG,
+                                        fg=TEXT, disabledforeground=TEXT,
+                                        relief="flat")
+        self.co_folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Button(co_row, text="Browse", command=self._on_browse_combat,
+                  bg=ACCENT, fg=TEXT, activebackground="#aa0000",
+                  activeforeground=TEXT, relief="flat", padx=10
+                  ).pack(side="right")
+        self.co_count_var = tk.StringVar(value="Combat Tracks: 0")
+        tk.Label(pl, textvariable=self.co_count_var, bg=PANEL, fg=GREY,
+                 font=("Segoe UI", 9)).pack(anchor="w")
 
         # Detection settings
         ds = tk.Frame(r, bg=PANEL, padx=10, pady=10)
@@ -815,15 +1164,25 @@ class App:
 
     # ----- UI callbacks -----
 
-    def _on_browse(self):
-        path = filedialog.askdirectory(title="Select Music Folder")
+    def _on_browse_combat(self):
+        path = filedialog.askdirectory(title="Select Combat Music Folder")
         if not path:
             return
-        self.cfg.music_folder = path
-        self.folder_var.set(path)
-        n = self.player.load_folder(path)
+        self.cfg.combat_folder = path
+        self.co_folder_var.set(path)
+        n = self.player.load_combat_folder(path)
         self.cfg.save()
-        self._update_track_count_label(n)
+        self.co_count_var.set("Combat Tracks: " + str(n))
+
+    def _on_browse_non_combat(self):
+        path = filedialog.askdirectory(title="Select Non-Combat (Ambient) Music Folder")
+        if not path:
+            return
+        self.cfg.non_combat_folder = path
+        self.nc_folder_var.set(path)
+        n = self.player.load_non_combat_folder(path)
+        self.cfg.save()
+        self.nc_count_var.set("Non-Combat Tracks: " + str(n))
 
     def _on_scan_changed(self, _evt=None):
         val = self.scan_var.get()
@@ -855,10 +1214,18 @@ class App:
     def _on_start(self):
         if self.detector is not None and self.detector.is_alive():
             return
-        if self.player.track_count() == 0:
+        nc = self.player.non_combat_count()
+        co = self.player.combat_count()
+        if nc == 0 and co == 0:
             self._set_status(ST_IDLE, 0)
-            self.ticker_var.set("No tracks loaded - pick a music folder")
+            self.ticker_var.set("Pick at least one music folder (combat or non-combat)")
             return
+        if nc == 0:
+            self.ticker_var.set("WARNING: no non-combat folder; ambient will be silent")
+        if co == 0:
+            self.ticker_var.set("WARNING: no combat folder; lock won't trigger music")
+        # Begin ambient playback; combat fires on lock via the detector.
+        self.player.start()
         self.detector = Detector(self)
         self.detector.start()
         self.start_btn.configure(state="disabled")
@@ -893,9 +1260,9 @@ class App:
     # ----- queue / status / ticker -----
 
     def _update_track_count_label(self, n=None):
-        if n is None:
-            n = self.player.track_count()
-        self.track_count_var.set("Tracks Loaded: " + str(n))
+        # Replaces old single-folder label with per-category counts.
+        self.nc_count_var.set("Non-Combat Tracks: " + str(self.player.non_combat_count()))
+        self.co_count_var.set("Combat Tracks: " + str(self.player.combat_count()))
 
     def _set_status(self, state, remaining):
         if state == ST_IDLE:
