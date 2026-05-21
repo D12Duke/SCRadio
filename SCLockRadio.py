@@ -59,7 +59,13 @@ class _FsyncFileHandler(logging.FileHandler):
 
 
 def _setup_logger():
-    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sclr.log")
+    # Same frozen-aware path resolution as script_dir(), but inlined because
+    # the logger initializes at module-import time, before script_dir is defined.
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(base, "sclr.log")
     lg = logging.getLogger("sclr")
     lg.setLevel(logging.DEBUG)
     for h in list(lg.handlers):
@@ -163,6 +169,12 @@ ST_TIMEOUT = "TIMEOUT COUNTDOWN"
 
 
 def script_dir():
+    """Folder we read/write runtime files from. When running as a frozen
+    PyInstaller bundle, this is the folder containing the .exe (so config,
+    log, and tshots live next to the executable, not inside the temp
+    extraction dir under sys._MEIPASS)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -435,6 +447,56 @@ class CrossfadePlayer:
         with self._lock:
             return len(self.co_tracks)
 
+    # ---- manual volume ramp (replaces pygame's built-in fade_ms) ----
+    def _spawn_ramp(self, channel, channel_tag, target_volume, duration_ms,
+                    stop_at_end=False):
+        """Schedule a volume ramp on `channel`. The ramp runs on its own
+        daemon thread. Older ramps on the same channel get superseded so
+        rapid engage/disengage doesn't produce overlapping fades."""
+        with self._ramp_lock:
+            if channel_tag == "nc":
+                self._ramp_id_nc += 1
+                ramp_id = self._ramp_id_nc
+            else:
+                self._ramp_id_co += 1
+                ramp_id = self._ramp_id_co
+        t = threading.Thread(
+            target=self._ramp_run,
+            args=(channel, channel_tag, ramp_id, float(target_volume),
+                  int(duration_ms), bool(stop_at_end)),
+            daemon=True, name="ramp-" + channel_tag)
+        t.start()
+
+    def _ramp_run(self, channel, channel_tag, ramp_id, target_volume,
+                  duration_ms, stop_at_end):
+        """Linear ramp from current channel volume to `target_volume` over
+        `duration_ms`. ~60 steps for smooth perceptual fade. Aborts if a
+        newer ramp on the same channel has been spawned."""
+        STEPS = 60
+        try:
+            start_v = float(channel.get_volume())
+        except Exception:
+            start_v = 1.0
+        step_dt = max(0.001, (duration_ms / 1000.0) / STEPS)
+        for i in range(1, STEPS + 1):
+            with self._ramp_lock:
+                current = (self._ramp_id_nc if channel_tag == "nc"
+                           else self._ramp_id_co)
+            if current != ramp_id:
+                return  # superseded by a newer ramp
+            v = start_v + (target_volume - start_v) * (i / STEPS)
+            v = max(0.0, min(1.0, v))
+            try:
+                channel.set_volume(v)
+            except Exception:
+                return
+            time.sleep(step_dt)
+        if stop_at_end and target_volume <= 0.0:
+            try:
+                channel.stop()
+            except Exception:
+                pass
+
     # ---- playback helpers (internal, assume self._lock held) ----
     def _play_nc_next(self, fade_in):
         """Start the next non-combat track. Pops from the ready deque (warm
@@ -463,9 +525,17 @@ class CrossfadePlayer:
                 return
         self.nc_sound = sound
         self.nc_name = os.path.splitext(os.path.basename(path))[0]
-        fade_ms = self.FADE_MS if fade_in else 0
         try:
-            self.ch_nc.play(self.nc_sound, fade_ms=fade_ms)
+            if fade_in:
+                # Start silent, then ramp up via _spawn_ramp. Set volume
+                # BEFORE play() so the first sample comes out at 0 volume.
+                self.ch_nc.set_volume(0.0)
+                self.ch_nc.play(self.nc_sound)
+                self._spawn_ramp(self.ch_nc, "nc", target_volume=1.0,
+                                 duration_ms=self.FADE_MS, stop_at_end=False)
+            else:
+                self.ch_nc.set_volume(1.0)
+                self.ch_nc.play(self.nc_sound)
         except Exception as ex:
             LOG.warning("nc play failed: %s", ex)
             return
@@ -474,7 +544,6 @@ class CrossfadePlayer:
         if self.nc_index >= len(self.nc_tracks):
             random.shuffle(self.nc_tracks)
             self.nc_index = 0
-        # Top up preload buffer back to PRELOAD_DEPTH
         self._top_up_preload_nc()
 
     def _play_co_next(self, fade_in):
@@ -501,9 +570,15 @@ class CrossfadePlayer:
                 return
         self.co_sound = sound
         self.co_name = os.path.splitext(os.path.basename(path))[0]
-        fade_ms = self.FADE_MS if fade_in else 0
         try:
-            self.ch_co.play(self.co_sound, fade_ms=fade_ms)
+            if fade_in:
+                self.ch_co.set_volume(0.0)
+                self.ch_co.play(self.co_sound)
+                self._spawn_ramp(self.ch_co, "co", target_volume=1.0,
+                                 duration_ms=self.FADE_MS, stop_at_end=False)
+            else:
+                self.ch_co.set_volume(1.0)
+                self.ch_co.play(self.co_sound)
         except Exception as ex:
             LOG.warning("co play failed: %s", ex)
             return
@@ -548,13 +623,14 @@ class CrossfadePlayer:
             if not self.co_tracks:
                 LOG.info("engage_combat ignored: no combat tracks loaded")
                 return
-            # Fade out non-combat
+            # Manual fade-out of non-combat (superseding any in-flight ramp)
             try:
                 if self.ch_nc.get_busy():
-                    self.ch_nc.fadeout(self.FADE_MS)
+                    self._spawn_ramp(self.ch_nc, "nc", target_volume=0.0,
+                                     duration_ms=self.FADE_MS, stop_at_end=True)
             except Exception:
                 pass
-            # Fade in combat (new song)
+            # Fade-in combat (new song)
             self._play_co_next(fade_in=True)
             self.in_combat = True
 
@@ -565,7 +641,8 @@ class CrossfadePlayer:
                 return
             try:
                 if self.ch_co.get_busy():
-                    self.ch_co.fadeout(self.FADE_MS)
+                    self._spawn_ramp(self.ch_co, "co", target_volume=0.0,
+                                     duration_ms=self.FADE_MS, stop_at_end=True)
             except Exception:
                 pass
             self._play_nc_next(fade_in=True)
@@ -612,6 +689,10 @@ class Detector(threading.Thread):
         # the screen for diagnostics.
         self._prev_cond_b = False
         self._losslock_snap_count = 0
+        # Track last name pushed to the UI so we only push on change
+        # (otherwise the marquee scroll position resets every scan and the
+        # ticker looks frozen at "first few chars").
+        self._last_pushed_name = None
         self._kb_hook = None
         # measure primary monitor
         with mss.mss() as sct:
@@ -651,9 +732,8 @@ class Detector(threading.Thread):
             "width": SEARCH_W,
             "height": SEARCH_H,
         }
-        # Per-T-press capture dir
-        self.shots_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "tshots")
+        # Per-T-press capture dir (next to exe when frozen, next to script in dev)
+        self.shots_dir = os.path.join(script_dir(), "tshots")
         try:
             os.makedirs(self.shots_dir, exist_ok=True)
         except Exception:
@@ -730,13 +810,15 @@ class Detector(threading.Thread):
         r = search_arr[:, :, 2]
         mask = ((r >= LOCK_R_MIN) & (r <= LOCK_R_MAX)
                 & (g <= LOCK_G_MAX) & (b <= LOCK_B_MAX))
-        # Reticle + cockpit-beam exclusion: SC's reticle is dead-center, AND
-        # the horizontal cockpit beam runs through center on most ships. An
-        # 80x80 hole covers both. The lock bracket sits AROUND the target,
-        # which is usually visible in the area outside the hole.
+        # Reticle exclusion: SC's center aim reticle has small red tick marks
+        # that match our lock-red filter. Zero out a 40x40 center hole.
+        # NOTE: 80x80 was tested but is too aggressive -- the lock bracket
+        # of close/centered targets fits entirely inside 80x80 and gets
+        # excluded, preventing music from staying locked. 40x40 just covers
+        # the reticle while leaving room for the bracket.
         h, w = mask.shape
         cy, cx = h // 2, w // 2
-        hole = 40  # half-width of exclusion (80x80 total)
+        hole = 20  # half-width (40x40 total)
         mask[max(0, cy - hole):cy + hole, max(0, cx - hole):cx + hole] = False
         total_lock_red = int(mask.sum())
         if total_lock_red == 0:
@@ -931,7 +1013,6 @@ class Detector(threading.Thread):
                             player.engage_combat()
                             timeout_started_at = None
                             self.q.put(("status", ST_LOCKED, 0))
-                            self.q.put(("now_playing", player.now_playing()))
                         else:
                             self.q.put(("status", ST_SCAN, 0))
                     else:
@@ -941,7 +1022,6 @@ class Detector(threading.Thread):
                             # lock still confirmed -> reset timer, keep combat
                             timeout_started_at = None
                             self.q.put(("status", ST_LOCKED, 0))
-                            self.q.put(("now_playing", player.now_playing()))
                         else:
                             if timeout_started_at is None:
                                 timeout_started_at = time.time()
@@ -956,12 +1036,18 @@ class Detector(threading.Thread):
                                 self.last_t_press_ts = 0.0
                                 LOG.info("Lock-lost timeout reached (%ds): combat -> non-combat, T invalidated", lock_timeout)
                                 self.q.put(("status", ST_SCAN, 0))
-                                self.q.put(("now_playing", player.now_playing()))
                             else:
                                 self.q.put(("status", ST_TIMEOUT, remaining))
 
                     # Advance the active queue if its current song ended.
                     player.tick()
+
+                    # Push current now-playing only when it changes, so the
+                    # marquee scroll position isn't reset every scan.
+                    current_name = player.now_playing()
+                    if current_name != self._last_pushed_name:
+                        self.q.put(("now_playing", current_name))
+                        self._last_pushed_name = current_name
 
                     # Sleep in small chunks so stop is responsive AND so song
                     # transitions feel snappy (we tick mid-interval too).
@@ -1255,6 +1341,18 @@ class App:
             pygame.mixer.quit()
         except Exception:
             pass
+        # Wipe the tshots/ debug capture folder on graceful exit. These are
+        # diagnostic-only artifacts; preserving them across sessions just
+        # clutters the disk. (atexit on crash WON'T fire this, which is
+        # intentional -- you'd want the snapshots from a crash to debug.)
+        try:
+            import shutil
+            shots = os.path.join(script_dir(), "tshots")
+            if os.path.isdir(shots):
+                shutil.rmtree(shots, ignore_errors=True)
+                LOG.info("Cleaned tshots/ on exit")
+        except Exception as ex:
+            LOG.warning("tshots cleanup failed: %s", ex)
         self.root.destroy()
 
     # ----- queue / status / ticker -----
